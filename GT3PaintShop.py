@@ -21,7 +21,7 @@ import zlib
 from pathlib import Path
 from typing import Any
 
-VERSION = '2.0.1'
+VERSION = '2.0.2'
 PAGE = 'at/ps/ps'
 APPLY_PAGE = 'at/ps/apply'
 INPUT_NAMES = ('gt_mode.mbl', 'gt_mode601.pmb', 'gt_mode610.pmb', 'gt_mode310.pmb')
@@ -653,15 +653,60 @@ def find_inputs(source: Path, locale: str) -> tuple[dict[str, Path], Path | None
 
 def safe_outdir(output: Path, source: Path):
     resolved = output.resolve()
-    # Write to a separate folder. Keep the original extracted menus untouched.
-    if resolved == source.resolve() or resolved.is_relative_to(source.resolve()):
-        raise BuildError('Refusing to write inside the source tree. Choose a separate --output directory.')
-    if resolved.exists() and (not resolved.is_dir() or any(resolved.iterdir())):
-        raise BuildError('Output must be a new or empty directory; no existing files will be overwritten')
+    src = source.resolve()
+    # Don't put generated menus into the folder we are reading from.
+    if resolved == src or resolved.is_relative_to(src):
+        raise BuildError('Choose an output folder outside the source directory.')
+    if output.is_symlink():
+        raise BuildError(f'Output folder is a symbolic link: {output}')
+    if output.exists() and not output.is_dir():
+        raise BuildError(f'Output path is not a folder: {output}')
+
+
+def output_matches(output: Path, files: dict[str, bytes], locale: str) -> bool:
+    # When somebody runs the same command again, there's no need to rebuild
+    # files that are already there. Check the actual contents, not timestamps.
+    report = output / 'build_report.json'
+    if not report.is_file():
+        return False
+    try:
+        previous = json.loads(report.read_text(encoding='utf-8'))
+        expected = {name: digest(raw) for name, raw in files.items()}
+        if not isinstance(previous, dict) or previous.get('output_hashes') != expected:
+            return False
+        for name, raw in files.items():
+            rel = Path('menu') / (name if name.endswith('.mbl') else str(Path(locale) / name))
+            path = output / rel
+            if not path.is_file() or path.stat().st_size != len(raw):
+                return False
+            if digest(path.read_bytes()) != digest(raw):
+                return False
+        return True
+    except (OSError, ValueError, UnicodeError):
+        return False
+
+
+def choose_output(output: Path, source: Path, files: dict[str, bytes], locale: str) -> tuple[Path, str]:
+    safe_outdir(output, source)
+    if not output.exists() or not any(output.iterdir()):
+        return output, 'new'
+    if output_matches(output, files, locale):
+        return output, 'unchanged'
+
+    # Keep the old output instead of asking people to delete it first.
+    # An existing folder is never picked just because its name looks unused.
+    for number in range(2, 10000):
+        candidate = output.with_name(f'{output.name}_{number}')
+        safe_outdir(candidate, source)
+        if not candidate.exists():
+            return candidate, 'numbered'
+    raise BuildError(f'Could not find a free output folder next to {output}')
 
 
 def write_outputs(output: Path, files: dict[str, bytes], report: dict, locale: str):
-    # All checks happen before this. Only write into a new, empty folder.
+    # Never replace someone else's output if it appeared in the meantime.
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise BuildError(f'Output folder is no longer empty: {output}')
     output.mkdir(parents=True, exist_ok=True)
     manifest = {}
     for name, raw in files.items():
@@ -693,7 +738,7 @@ def main(argv=None) -> int:
     )
     parser.add_argument('--source', type=Path, required=True,
                         help='Extracted game data root (with menu/) or a flat folder holding the four input files')
-    parser.add_argument('--output', type=Path, help='New/empty output folder. Required unless --check-only')
+    parser.add_argument('--output', type=Path, help='Output folder (a numbered folder is used if it already holds different files)')
     parser.add_argument('--locale', default='BR', help='GT3 localization folder, default BR; other locales untested')
     parser.add_argument('--check-only', action='store_true', help='Validate inputs and calculate outputs in memory, without writing')
     parser.add_argument('--version', action='version', version=f'GT3 Paint Shop Portable v{VERSION}')
@@ -703,30 +748,32 @@ def main(argv=None) -> int:
     if not args.check_only and args.output is None:
         parser.error('--output is required unless --check-only is specified')
     paths, data_root = find_inputs(args.source, args.locale)
+    if not args.check_only:
+        # Check the destination before doing the more expensive menu build.
+        safe_outdir(args.output, args.source)
     originals = {}
     for name, path in paths.items():
         if path.stat().st_size > MAX_BINARY:
             raise BuildError(f'Input is too large: {path}')
         originals[name] = path.read_bytes()
     outputs, report = build_paint_shop(originals)
-    print('PASS: four original MBL/PMB inputs parsed and round-tripped byte-exactly')
-    print(f'PASS: built Paint Shop and the {APPLY_PAGE} repaint page')
-    print('PASS: menu ordering, native apply callback, image indices, and original pages checked')
-    print('Input files are checked by menu structure, not by a list of known file hashes.')
-    print('NOTE: Other game revisions and modified menus still need in-game testing.')
-    if data_root is not None:
-        fbi = data_root / 'menu' / 'showroom_garage.fbi'
-        if not fbi.is_file():
-            print('WARNING: showroom_garage.fbi not found at the expected extracted-game location')
-        # The game already loads this camera preset. We don't need to touch it.
     if args.check_only:
-        print('CHECK ONLY: no files were written')
-    else:
-        safe_outdir(args.output, args.source)
-        write_outputs(args.output, outputs, report, args.locale)
-        print(f'Generated 3 files under {args.output.resolve()}')
-        print('No ELF, database, FBI, PNACH, ISO, or game installation was modified.')
-        print('NOTE: CHANGE PAINT still needs its first in-game check. Use a copied memory card.')
+        print('Menu files and Paint Shop layout: OK')
+        print('Check only. No files were written.')
+        return 0
+
+    destination, status = choose_output(args.output, args.source, outputs, args.locale)
+    if status == 'unchanged':
+        print('Paint Shop output is already up to date. Nothing was overwritten.')
+        print(f'Output: {destination.resolve()}')
+        return 0
+    if status == 'numbered':
+        print(f'Output folder already contains files. Using {destination.resolve()} instead.')
+    write_outputs(destination, outputs, report, args.locale)
+    print('Paint Shop menu files created successfully, replace your original files with the newly created ones')
+    print(f'Output: {destination.resolve()}')
+    if data_root is not None and not (data_root / 'menu' / 'showroom_garage.fbi').is_file():
+        print('Note: showroom_garage.fbi was not found; check that your game has its original camera files.')
     return 0
 
 
